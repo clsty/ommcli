@@ -19,6 +19,8 @@ Ollama Model Manager (CLI) which imports/exports/updates Ollama models.
 - You can also run `./ommcli` directly if shebang is supported.
 - Or copy `ommcli` to somewhere suitable, e.g. `/usr/local/bin/`, and then you can run `ommcli` everywhere.
 
+By default, `ommcli` assume your working directory has the target `docker-compose.yml` and use it to interact with `ollama`. If you want to use ollama on the system, use `ommcli --mode host` instead.
+
 A copy of help from the script (maybe outdated):
 
 ```plain
