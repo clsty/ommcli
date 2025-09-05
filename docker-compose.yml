@@ -1,0 +1,45 @@
+# This docker-compose.yml is only an example. If you already have one, you may also have reference from here.
+services:
+  ollama:
+    # https://hub.docker.com/r/ollama/ollama
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # To make data of Ollama persist, and also required by 'ommcli export':
+      # --h-model-dir : --c-model-dir
+      # Actually ( ./data/models : /root/.ollama/models ),
+      # but '/models' are the same in the path, so it's ok.
+      - ./data/:/root/.ollama
+      # Required by 'ommcli import':
+      # --h-backup-dir : --c-backup-dir
+      - ./ollama-model-backup/:/ollama-model-backup/
+    environment:
+      - OLLAMA_ORIGINS=*
+    # https://docs.docker.com/compose/how-tos/gpu-support/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - ollama-net
+
+networks:
+  ollama-net:
+    driver: bridge
+
+# Hint: If you also have another docker-compose.yml, to let it communicate with this Ollama container, example docker-compose.yml:
+# ---
+# services:
+#   something
+#     image: something
+#     networks:
+#       - ollama-net
+# networks:
+#   ollama-net:
+#     driver: external
+# ---
+# And, in this "something" container, use `ollama` as domain, e.g. http://ollama:11434/ .

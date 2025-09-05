@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+## !/usr/bin/env -S uv run --script
+# -*- coding: utf-8; mode: python -*-
+# vim: set filetype=python:
+
+# ommcli: Ollama Model Manager (CLI) which imports/exports/updates Ollama models
+
+import subprocess
+import re
+import os
+import shutil
+import argparse
+import sys
+
+COMPOSE_PROJECT_DIR = os.getcwd()
+
+def sanitize_filename_MF(name):
+    """Handle special characters in filename"""
+    name = name.replace(":latest", "")
+    return re.sub(r'[<>:"/\\|?*.]', '-', name)
+
+def run_command(command, mode='compose', working_dir=None):
+    """Run command inside system or container depending on the specified mode"""
+
+    if mode == 'compose':
+        # Use docker compose to run command inside the container
+        compose_cmd = f'docker compose -f "{os.path.join(COMPOSE_PROJECT_DIR, "docker-compose.yml")}"'
+
+        # For Windows
+        if working_dir and os.name == 'nt':
+            working_dir = working_dir.replace('\\', '/')
+        
+        if working_dir:
+            cmd = f'{compose_cmd} exec -w "{working_dir}" ollama {command}'
+        else:
+            cmd = f'{compose_cmd} exec ollama {command}'
+    else:  # if mode == 'host':
+        cmd = command
+    
+    # For Windows
+    if os.name == 'nt':
+        cmd = cmd.replace('/', '\\')
+        process = subprocess.Popen(
+            cmd, 
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            stdin=subprocess.PIPE, 
+            text=True, 
+            encoding='utf-8'
+        )
+    else:
+        process = subprocess.Popen(
+            cmd, 
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            stdin=subprocess.PIPE, 
+            text=True, 
+            encoding='utf-8'
+        )
+
+    output_text, error_text = process.communicate()
+
+    # Show errlog (if exists)
+    if error_text:
+        print(f"Error executing command: {error_text.strip()}")
+
+    return output_text.strip()
+
+def create_ollama_model_file(model_name, config, mode='compose'):
+    """Create Ollama model file and copy model data"""
+    # Get model template
+    template_command = f'ollama show --template {model_name}'
+    template = run_command(template_command, mode)
+    
+    if not template:
+        print(f"Error: model '{model_name}' not found or the template is empty. Please check the model name and try again.")
+        return
+    
+    # Get model params
+    parameters_command = f'ollama show --parameters {model_name}'
+    parameters = run_command(parameters_command, mode)
+    
+    # Get model system info
+    system_command = f'ollama show --system {model_name}'
+    system_message = run_command(system_command, mode)
+    
+    # Get modelfile info
+    modelfile_command = f'ollama show --modelfile {model_name}'
+    modelfile_message = run_command(modelfile_command, mode)
+    
+    sanitized_name = sanitize_filename_MF(model_name)
+    output_file = "ModelFile"
+    new_folder_path = os.path.join(config.host_backup_dir, sanitized_name)
+    
+    # Check if a backup exists already
+    if not config.overwrite and os.path.exists(new_folder_path) and os.path.isdir(new_folder_path):
+        print(f"Model: '{sanitized_name}' already exists in the backup folder, skipping.")
+        return
+    
+    # Create directory for the backup
+    if not os.path.exists(new_folder_path):
+        os.makedirs(new_folder_path)
+        print(f"Created folder: {new_folder_path}")
+    else:
+        print(f"Folder already exists: {new_folder_path}")
+    
+    # Create the content of `ModelFile`
+    model_content = f"""FROM {sanitized_name}.gguf
+TEMPLATE """ + '"""' + f"""{template}""" + '"""' + "\n"
+    
+    for line in parameters.splitlines():
+        model_content += f'PARAMETER {line}\n'
+    
+    model_content += f'system "{system_message}"\n'
+    
+    # Write content into `ModelFile`
+    with open(os.path.join(new_folder_path, output_file), 'w') as file:
+        file.write(model_content)
+    
+    print(f'Model file created: {output_file}')
+    
+    # Save original model name to `ModelName`
+    with open(os.path.join(new_folder_path, "ModelName"), 'w') as file:
+        file.write(model_name)
+    print(f'Original model name saved: ModelName')
+    
+    # Get GGUF file path from modelfile
+    modelfile_message = modelfile_message.strip()
+    
+    model_dir = config.container_model_dir
+        
+    model_file_location_match = re.search(
+        fr'FROM\s+({re.escape(model_dir)}[^\s]*)', 
+        modelfile_message, 
+        re.MULTILINE
+    )
+    
+    if model_file_location_match:
+        container_model_path = model_file_location_match.group(1)
+        print(f"Model path: {container_model_path}")
+        
+        # For compose mode, transfer path
+        if mode == 'compose':
+            host_model_path = container_model_path.replace(
+                config.container_model_dir,
+                config.host_model_dir
+            )
+            # For Windows
+            if os.name == 'nt':
+                host_model_path = os.path.normpath(host_model_path)
+            print(f"Host model path: {host_model_path}")
+        else:  # For host mode, directly use the path
+            host_model_path = container_model_path
+        
+        new_model_file_name = f"{sanitized_name}.gguf"
+        new_model_file_path = os.path.join(new_folder_path, new_model_file_name)
+
+        if os.path.exists(host_model_path):
+            shutil.copy2(host_model_path, new_model_file_path)
+            print(f"Copied and renamed model file to: {new_model_file_path}")
+        else:
+            print(f"Model file not found at: {host_model_path}")
+    else:
+        print("Model_file_location_not_found")
+
+def extract_names(data):
+    """Get model name list from `ollama list`"""
+    lines = data.strip().split('\n')
+    names = [line.split()[0] for line in lines[1:]]
+    return names
+
+def export_models(config, mode='compose'):
+    """Export specified model or all models"""
+    # Ensure backups directory exists
+    config.host_backup_dir = os.path.abspath(config.host_backup_dir)
+    if not os.path.exists(config.host_backup_dir):
+        os.makedirs(config.host_backup_dir)
+        print(f"Created backup directory: {config.host_backup_dir}")
+    
+    # Export all models
+    if not config.model:
+        print("Exporting all models...")
+        data = run_command("ollama list", mode)
+        model_names = extract_names(data)
+        if not model_names:
+            print("No models found. Exiting.")
+            return
+            
+        print(f"Found {len(model_names)} models: {', '.join(model_names)}")
+        for model_name in model_names:
+            print(f"\nProcessing model: {model_name}")
+            create_ollama_model_file(model_name, config, mode)
+    
+    # Export one model
+    else:
+        print(f"Exporting model: {config.model}")
+        create_ollama_model_file(config.model, config, mode)
+
+def import_models(config, mode='compose'):
+    """Import specified model or all models"""
+    # Overwrite==true --> Skipping-existed==false
+    # Overwrite==false --> Skipping-existed==true
+    skip_existed = not config.overwrite
+
+    # Ensure backups directory exists
+    config.host_backup_dir = os.path.abspath(config.host_backup_dir)
+    if not os.path.exists(config.host_backup_dir):
+        print(f"Backup directory not found: {config.host_backup_dir}")
+        return
+    
+    # Under host mode, use `host_backup_dir` instead of `container_backup_dir`
+    if mode == 'host':
+        config.container_backup_dir = config.host_backup_dir
+        
+    # Get existed model list (for skipping existed models)
+    existing_models = []
+    if skip_existed:
+        list_data = run_command("ollama list", mode)
+        existing_models = extract_names(list_data) if list_data else []
+        print(f"Existing models: {', '.join(existing_models)}")
+    
+    # Import one model
+    if config.model:
+        sanitized_name = sanitize_filename_MF(config.model)
+        model_folder = os.path.join(config.host_backup_dir, sanitized_name)
+        if not os.path.exists(model_folder):
+            print(f"Model folder not found: {model_folder}")
+            return
+        # Check if model already exists in Ollama
+        if skip_existed and config.model in existing_models:
+            print(f"Model '{config.model}' already exists. Skipping.")
+            return
+
+        print(f"Importing model: {sanitized_name}")
+        import_model_folder(model_folder, config, mode)
+    
+    # Import all models
+    else:
+        print("Importing all models in backup directory...")
+        for entry in os.listdir(config.host_backup_dir):
+            model_folder = os.path.join(config.host_backup_dir, entry)
+            if os.path.isdir(model_folder):
+                # Get original model name
+                modelname_path = os.path.join(model_folder, "ModelName")
+                if os.path.exists(modelname_path):
+                    with open(modelname_path, 'r') as f:
+                        original_name = f.read().strip()
+                    # Skip existed if needed
+                    if skip_existed and original_name in existing_models:
+                        print(f"Skipping existing model: {original_name}")
+                        continue
+                import_model_folder(model_folder, config, mode)
+
+def import_model_folder(model_folder, config, mode='compose'):
+    """Import one model from its folder"""
+    model_name = os.path.basename(model_folder)
+    
+    # Check if model file exists
+    gguf_files = [f for f in os.listdir(model_folder) if f.endswith('.gguf')]
+    modelfile_path = os.path.join(model_folder, "ModelFile")
+    modelname_path = os.path.join(model_folder, "ModelName")
+    
+    # Use name from `ModelName` if possible
+    if os.path.exists(modelname_path):
+        with open(modelname_path, 'r') as f:
+            original_model_name = f.read().strip()
+        print(f"Using original model name: {original_model_name}")
+        model_name = original_model_name
+    
+    if not gguf_files:
+        print(f"Skipping folder '{model_name}': No .gguf files found")
+        return
+    
+    if not os.path.exists(modelfile_path):
+        print(f"Skipping folder '{model_name}': ModelFile not found")
+        return
+    
+    print(f'Import model: {model_name}')
+    
+    # Under compose mode, transfer path
+    if mode == 'compose':
+        # For Windows
+        if os.name == 'nt':
+            container_path = model_folder.replace('\\', '/').replace(
+                config.host_backup_dir.replace('\\', '/'),
+                config.container_backup_dir
+            )
+        else:
+            container_path = model_folder.replace(
+                config.host_backup_dir,
+                config.container_backup_dir
+            )
+        print(f'Container path: {container_path}')
+    else:  # Under host mode, directly use the path
+        container_path = model_folder
+    
+    print(f'Working directory: {container_path}')
+    
+    # Use ollama command to import
+    cmd = f'ollama create {model_name} -f "ModelFile"'
+    print(run_command(cmd, mode, working_dir=container_path))
+    print(f"Model '{model_name}' imported successfully")
+
+def update_models(config, mode='compose'):
+    """Update all models used by Ollama"""
+    print("Updating all Ollama models...")
+    
+    # Get model name list
+    data = run_command("ollama list", mode)
+    model_names = extract_names(data)
+    
+    if not model_names:
+        print("No models found. Exiting.")
+        return
+        
+    print(f"Found {len(model_names)} models to update: {', '.join(model_names)}")
+    
+    # Update every models
+    for model_name in model_names:
+        print(f"\nUpdating model: {model_name}")
+        update_command = f'ollama pull {model_name}'
+        run_command(update_command, mode)
+    
+    print("\nAll models updated successfully")
+
+def list_models(config, mode='compose'):
+    """List all models used by Ollama"""
+    
+    print(run_command("ollama list", mode))
+
+def exec_command(command_args, working_dir, mode='compose'):
+    """Execute any command inside Ollama docker container"""
+    if not command_args:
+        print("Please provide the command to be executed.")
+        return
+    
+    command = ' '.join(command_args)
+    # For Windows
+    if os.name == 'nt' and working_dir:
+        working_dir = working_dir.replace('\\', '/')
+    
+    result = run_command(command, mode, working_dir)
+    
+    # Show result (run_command has showed error as needed)
+    if result:
+        print(result)
+
+def show_help():
+    """Show help"""
+    print("""ommcli: Ollama Model Manager (CLI) which imports/exports/updates Ollama models
+
+Syntax:
+          ommcli [global option] <subcommand> [subcommand option]
+
+Global option:
+  --mode <mode>      Running mode: compose (default; for Ollama as docker
+                     compose project) or host (for Ollama in system)
+
+Subcommand:
+  help     Show this help
+  export   Export model(s) from Ollama to backup directory
+  import   Import model(s) from backup directory to Ollama
+  update   Update all models used by Ollama
+  list     List all models used by Ollama
+  exec     Execute any command inside Ollama docker container
+
+
+Options for `export`:
+
+  --overwrite           Overwrite existing model inside the backup directory
+  --model <name>        name of one model to export (by default all models)
+
+  --c-model-dir <path>  Models directory used by Ollama in the container (default: /root/.ollama/models)
+  --h-model-dir <path>  Models directory used by Ollama on the host system (default: ./data/models)
+  --h-backup-dir <path> Models backup directory on the host system (default: ./ollama-model-backup)
+
+  --model-dir <path>    Alias of `--c-model-dir <path>`
+  --backup-dir <path>   Alias of `--h-backup-dir <path>`
+
+  Attention: The last character of the path should not be `/` or `\\` .
+  Attention: Under `host` mode, `--h-model-dir` is ignored and `--c-model-dir` will be used instead.
+        It's recommended to directly use `--backup-dir` and `--model-dir` to avoid confusion.
+  Attention: Under `compose` mode, subcommand `export` requires that both the model directories on the host
+        and in the container, have been mapped as same ones.
+
+
+Options for `import`:
+
+  --overwrite           Overwrite existing model used by Ollama
+  --model <name>        name of one model to import (by default all models)
+
+  --h-backup-dir <path> Models backup directory on the host system (default: ./ollama-model-backup)
+  --c-backup-dir <path> Models backup directory in the container (default: /ollama-model-backup)
+
+  --backup-dir <path>   Alias of `--h-backup-dir <path>`
+
+  Attention: The last character of the path should not be `/` or `\\` .
+  Attention: Under `host` mode, `--c-backup-dir` is ignored and `--h-backup-dir` will be used instead.
+        It's recommended to directly use `--backup-dir` to avoid confusion.
+  Attention: Under `compose` mode, subcommand `import` requires that both the backup directories on the host
+        and in the container, have been mapped as same ones.
+
+
+Options for `exec`:
+  -d <path>       Specify the working directory for the command to be executed.
+
+
+Examples:
+  Under `compose` mode, export all models:
+    ommcli --mode compose export
+  
+  Under `host` mode, update all models:
+    ommcli --mode host update
+  
+  Under `host` mode, import a model named `llama3`:
+    ommcli --mode host import --model llama3
+
+
+Attention for Windows:
+  1. The script is developed under Linux.
+     It's also for Windows as a wish, and some lines are written for Windows,
+     but this has not been actually tested.
+     Feedback welcomed on https://github.com/clsty/ommcli
+  2. In the path please use `/` or `\\\\`, and avoid `\\`.
+  3. For path inside the container, use `/`
+""")
+
+def main():
+    """Main: Handle arguments"""
+    parser = argparse.ArgumentParser(description='ommcli: imports/exports/updates Ollama models', add_help=False)
+    parser.add_argument('--mode', type=str, choices=['compose', 'host'], default='compose',
+                        help='Running mode: compose (using docker compose) or host (direct), default: compose')
+    subparsers = parser.add_subparsers(dest='subcommand')
+    
+    # subcommand: help
+    help_parser = subparsers.add_parser('help', help='Show help')
+    
+    # subcommand: export
+    export_parser = subparsers.add_parser('export', help='Export model(s) from Ollama to backup directory')
+    export_parser.add_argument('--overwrite', action='store_true', 
+                               help='Overwrite existing model inside the backup directory')
+    export_parser.add_argument('--model', type=str, help='name of one model to export')
+    export_parser.add_argument('--h-backup-dir', '--backup-dir', dest='host_backup_dir', type=str, default='./ollama-model-backup', 
+                               help='Models backup directory on the host system (default: ./ollama-model-backup)')
+    export_parser.add_argument('--c-model-dir', '--model-dir', dest='container_model_dir', type=str, default='/root/.ollama/models', 
+                               help='Models directory used by Ollama in the container (default: /root/.ollama/models)')
+    export_parser.add_argument('--h-model-dir', dest='host_model_dir', type=str, default='./data/models', 
+                               help='Models directory used by Ollama on the host system (default: ./data/models)')
+    
+    # subcommand: import
+    import_parser = subparsers.add_parser('import', help='Import model(s) from backup directory to Ollama')
+    import_parser.add_argument('--overwrite', action='store_true', 
+                               help='Overwrite existing model used by Ollama')
+    import_parser.add_argument('--model', type=str, help='name of one model to import')
+    import_parser.add_argument('--h-backup-dir', '--backup-dir', dest='host_backup_dir', type=str, default='./ollama-model-backup', 
+                               help='Models backup directory on the host system (default: ./ollama-model-backup)')
+    import_parser.add_argument('--c-backup-dir', dest='container_backup_dir', type=str, default='/ollama-model-backup', 
+                               help='Models backup directory in the container (default: /ollama-model-backup)')
+    
+    # subcommand: update
+    update_parser = subparsers.add_parser('update', help='Update all models used by Ollama')
+    
+    # subcommand: list
+    list_parser = subparsers.add_parser('list', help='List all models used by Ollama')
+
+    # subcommand: exec
+    exec_parser = subparsers.add_parser('exec', help='Execute any command inside Ollama docker container')
+    exec_parser.add_argument('subcommand_args', nargs=argparse.REMAINDER, 
+                                help='Command to be executed with args (eg. ls -la)')
+    exec_parser.add_argument('-d', dest='working_dir', type=str, default=None, 
+                                help='Specify the working directory when executing command')
+
+    # Parse args
+    args = parser.parse_args()
+    
+    # Handle subcommand
+    if not args.subcommand or args.subcommand == 'help':
+        show_help()
+    elif args.subcommand == 'export':
+        export_models(args, mode=args.mode)
+    elif args.subcommand == 'import':
+        import_models(args, mode=args.mode)
+    elif args.subcommand == 'update':
+        update_models(args, mode=args.mode)
+    elif args.subcommand == 'list':
+        list_models(args, mode=args.mode)
+    elif args.subcommand == 'exec':
+        exec_command(args.subcommand_args, args.working_dir, args.mode)
+    else:
+        print(f"ERROR: Unknown subcommand '{args.subcommand}'")
+        show_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
