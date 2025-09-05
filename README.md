@@ -3,7 +3,7 @@ Ollama Model Manager (CLI) which imports/exports/updates Ollama models.
 
 ## Features
 - Designed for Ollama both as docker compose (default) or directly on the system (`ommcli --mode host`).
-- import/export/update/backup/dump/... Multiple functions in a single script.
+- import/export(dump/backup)/update/... Multiple functions in a single script.
 - Automatically skips existing models in Ollama during import and export by default.
 - During export, the full model name is saved into the `ModelName` file, and it is automatically recognized during import to retrieve the correct name, allowing existing model upgrades using `ollama pull`.
 
